@@ -57,6 +57,8 @@ const {
 
 const { isAccountingOnlyUser, canAccountingViewDisbursement } = require('../../lib/disbursementVisibility');
 
+const isExternalReceiptUrl = (val) => typeof val === 'string' && /^https?:\/\//i.test(val.trim());
+
 /** Canonical status transitions */
 const VALID_TRANSITIONS = {
   approve: { from: ['Draft'], to: 'Approved' },
@@ -804,6 +806,8 @@ const enrichDisbursementExtras = async (rows = []) => {
       edited_by_accounting: editedByAccounting,
       lifecycle_history: historyItems,
       audit_trail: historyItems,
+      external_url: isExternalReceiptUrl(row.receipt_s3_key) ? row.receipt_s3_key.trim() : null,
+      externalUrl: isExternalReceiptUrl(row.receipt_s3_key) ? row.receipt_s3_key.trim() : null,
     };
   });
 };
@@ -1036,11 +1040,20 @@ const createDisbursement = async ({ entityId, entityCode, userId, user, data }) 
 
   await validateReferenceScope(entityId, data, null, effectiveWrId);
 
+  const effectiveReceiptKey =
+    data.externalUrl !== undefined
+      ? data.externalUrl
+        ? data.externalUrl.trim()
+        : null
+      : data.receiptS3Key
+        ? data.receiptS3Key.trim()
+        : null;
+
   // Atomically claim receipt reservation if receiptS3Key is supplied (R4 / AC-4)
   let receiptClaim = null;
-  if (data.receiptS3Key) {
+  if (effectiveReceiptKey && !isExternalReceiptUrl(effectiveReceiptKey)) {
     const claimResult = await claimReservationByKey({
-      receiptS3Key: data.receiptS3Key,
+      receiptS3Key: effectiveReceiptKey,
       userId,
       entityId,
     });
@@ -1093,7 +1106,7 @@ const createDisbursement = async ({ entityId, entityCode, userId, user, data }) 
         requested_by: userId,
         due_date: data.dueDate || null,
         notes: data.notes || null,
-        receipt_s3_key: data.receiptS3Key || null,
+        receipt_s3_key: effectiveReceiptKey || null,
         receipt_filename: data.receiptFilename || null,
         created_by: userId,
         updated_by: userId,
@@ -1107,9 +1120,9 @@ const createDisbursement = async ({ entityId, entityCode, userId, user, data }) 
         .single();
 
       if (!error) {
-        if (data.receiptS3Key) {
+        if (effectiveReceiptKey && !isExternalReceiptUrl(effectiveReceiptKey)) {
           const consumed = await consumeReservationByKey({
-            receiptS3Key: data.receiptS3Key,
+            receiptS3Key: effectiveReceiptKey,
             userId,
             entityId,
             claimId: receiptClaim?.claimId,
@@ -1166,9 +1179,14 @@ const createDisbursement = async ({ entityId, entityCode, userId, user, data }) 
       code: 'DUPLICATE_DISBURSEMENT_NUMBER',
     });
   } catch (err) {
-    if (data.receiptS3Key && receiptClaim && !receiptWriteMayHaveCommitted) {
+    if (
+      effectiveReceiptKey &&
+      !isExternalReceiptUrl(effectiveReceiptKey) &&
+      receiptClaim &&
+      !receiptWriteMayHaveCommitted
+    ) {
       await releaseReservationByKey({
-        receiptS3Key: data.receiptS3Key,
+        receiptS3Key: effectiveReceiptKey,
         userId,
         entityId,
         claimId: receiptClaim.claimId,
@@ -1327,6 +1345,7 @@ const updateDisbursement = async ({ entityId, id, userId, data, user, internal =
     'dueDate',
     'notes',
     'receiptS3Key',
+    'externalUrl',
     'receiptFilename',
   ];
   const postDraftLinkFields = [
@@ -1583,7 +1602,7 @@ const updateDisbursement = async ({ entityId, id, userId, data, user, internal =
 
   // Handle receipt reservation claim & paired metadata
   let receiptReservationClaim = null;
-  const isReceiptKeyProvided = data.receiptS3Key !== undefined;
+  const isReceiptKeyProvided = data.receiptS3Key !== undefined || data.externalUrl !== undefined;
   const isReceiptFilenameProvided = data.receiptFilename !== undefined;
 
   const updates = {};
@@ -1635,10 +1654,27 @@ const updateDisbursement = async ({ entityId, id, userId, data, user, internal =
   if (data.notes !== undefined) updates.notes = data.notes;
 
   if (isReceiptKeyProvided || isReceiptFilenameProvided) {
-    const newKey = data.receiptS3Key;
+    const newKey =
+      data.externalUrl !== undefined
+        ? data.externalUrl
+          ? data.externalUrl.trim()
+          : null
+        : data.receiptS3Key;
     const newFilename = data.receiptFilename;
 
-    if (newKey === null) {
+    if (newKey && isExternalReceiptUrl(newKey)) {
+      const resolvedFilename = newFilename || existing.receipt_filename;
+      if (!resolvedFilename) {
+        throw new AppError({
+          statusCode: 400,
+          title: 'Bad Request',
+          detail: 'Cannot set external receipt URL without a valid receiptFilename.',
+          code: 'INVALID_RECEIPT_ATTACHMENT',
+        });
+      }
+      updates.receipt_s3_key = newKey;
+      updates.receipt_filename = resolvedFilename;
+    } else if (newKey === null) {
       if (newFilename) {
         throw new AppError({
           statusCode: 400,
@@ -2493,6 +2529,19 @@ const getReceiptUrl = async ({ entityId, id, userId: _userId, user }) => {
     });
   }
 
+  // Case 1.5: External URL
+  if (isExternalReceiptUrl(voucher.receipt_s3_key)) {
+    const externalUrl = voucher.receipt_s3_key.trim();
+    return {
+      url: externalUrl,
+      externalUrl,
+      isExternal: true,
+      filename: voucher.receipt_filename || 'External Receipt',
+      contentType: 'text/html',
+      expiresAt: null,
+    };
+  }
+
   // Case 2: Legacy record with receipt_filename present but receipt_s3_key is null
   if (!voucher.receipt_s3_key && voucher.receipt_filename) {
     return {
@@ -2580,4 +2629,5 @@ module.exports = {
   cleanupExpiredReservations,
   isAccountingOnlyUser,
   canAccountingViewDisbursement,
+  isExternalReceiptUrl,
 };
